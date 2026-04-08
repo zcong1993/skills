@@ -317,25 +317,33 @@ async function main() {
       return;
     }
 
-    const flights = routes.map((route) => {
-      const flight = route.directions[0]?.flights[0];
-      const aircraft = route.aircrafts[0];
+    const flights: object[] = [];
+    for (const route of routes) {
       const airlineInfo = route.airlines[0];
-      return {
-        flightNo: flight ? `${flight.airlineCode}${flight.flightNo}` : null,
-        airlineCode: flight?.airlineCode,
-        airlineName: airlineInfo?.name,
-        departureTime: flight?.departureTime,
-        arrivalTime: flight?.arrivalTime,
-        travelTime: flight?.travelTime,
-        from,
-        to,
-        date,
-        aircraftCode: aircraft?.code,
-        aircraftName: aircraft?.name,
-        planeId: aircraft?.planeId,
-      };
-    });
+      const aircraftByPlaneId: Record<string, Aircraft> = {};
+      for (const aircraft of route.aircrafts) {
+        aircraftByPlaneId[aircraft.planeId] = aircraft;
+      }
+      for (const direction of route.directions) {
+        for (const flight of direction.flights) {
+          const aircraft = aircraftByPlaneId[flight.planeId];
+          flights.push({
+            flightNo: `${flight.airlineCode}${flight.flightNo}`,
+            airlineCode: flight.airlineCode,
+            airlineName: airlineInfo?.name,
+            departureTime: flight.departureTime,
+            arrivalTime: flight.arrivalTime,
+            travelTime: flight.travelTime,
+            from: direction.departure,
+            to: direction.arrival,
+            date: flight.departureDate,
+            aircraftCode: aircraft?.code,
+            aircraftName: aircraft?.name,
+            planeId: flight.planeId,
+          });
+        }
+      }
+    }
 
     console.log(JSON.stringify(flights));
 
