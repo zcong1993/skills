@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /* eslint-disable */
-// @ts-nocheck
+declare const process: { argv: string[]; exit(code?: number): never };
 /**
  * fetch_seatmap.ts
  *
@@ -39,8 +39,14 @@ async function getToken(): Promise<string> {
   const res = await fetch("https://seatmaps.com/auth", {
     headers: { ...HEADERS, cookie: `cookie=${COOKIE}` },
   });
+  if (!res.ok) {
+    if (res.status === 401) {
+      throw new Error("Cookie 已过期。请访问 https://seatmaps.com，打开 DevTools → Application → Cookies，复制 'cookie' 的值，更新 fetch_seatmap.ts 中的 COOKIE 常量。");
+    }
+    throw new Error(`获取 token 失败: HTTP ${res.status}`);
+  }
   const json = (await res.json()) as { accessToken: string };
-  if (!json.accessToken) throw new Error("获取 token 失败");
+  if (!json.accessToken) throw new Error("获取 token 失败: 响应中无 accessToken");
   return json.accessToken;
 }
 
@@ -68,8 +74,14 @@ interface Airline {
   name: string;
 }
 
+interface Direction {
+  departure: string;
+  arrival: string;
+  flights: Flight[];
+}
+
 interface Route {
-  directions: { flights: Flight[] }[];
+  directions: Direction[];
   aircrafts: Aircraft[];
   airlines: Airline[];
 }
@@ -84,6 +96,9 @@ async function queryFlights(token: string, from: string, to: string, date: strin
       "sec-fetch-site": "same-site",
     },
   });
+  if (!res.ok) {
+    throw new Error(`查询航班失败: HTTP ${res.status}`);
+  }
   const json = (await res.json()) as { routes: Route[] };
   return json.routes ?? [];
 }
@@ -110,15 +125,6 @@ const F = {
   bassinet:           0x800,
 } as const;
 
-// Compact seat: n=number, cl=class, f=feature bitmask, w=isWindow, a=isAisle
-interface Seat {
-  n: string;   // seat number e.g. "42A"
-  cl: string;  // cabin class B/P/E
-  f: number;   // feature bitmask
-  w: 0 | 1;   // isWindow
-  a: 0 | 1;   // isAisle
-}
-
 interface CabinInfo {
   code: string;
   label: string;
@@ -136,14 +142,20 @@ interface ClassFeatures {
   [cls: string]: { seat_pitch?: string; seat_width?: string; seat_recline?: string; audio_video_ondemand?: string; usbPowerPlug?: string } | string | undefined;
 }
 
+// 优化后的座位数据：默认 feature + 例外列表
+interface SeatExceptions {
+  [featureValue: string]: string[]; // feature bitmask → 座位号列表
+}
+
 interface SeatmapData {
   planeId: string;
   aircraftName: string;
   classFeatures: ClassFeatures;
   cabins: CabinInfo[];
-  seats: Seat[];
+  defaultFeature: number;       // 大多数座位的 feature 值（通常是 standardSeat=1024）
+  seatExceptions: SeatExceptions; // 非默认 feature 的座位，按 feature 值分组
   wingRows: number[];
-  F: typeof F; // feature bitmask 解码表，随数据一起输出供 Claude 参考
+  F: typeof F;
 }
 
 function parseSeatmapHtml(html: string, planeId: string, aircraftName: string): SeatmapData {
@@ -213,9 +225,6 @@ function parseSeatmapHtml(html: string, planeId: string, aircraftName: string): 
     const cols = [...new Set(refCols)].sort((a, b) => getPos(a) - getPos(b));
     const sortedCols = [...cols].sort((a, b) => getPos(a) - getPos(b));
 
-    const minPos = getPos(sortedCols[0]);
-    const maxPos = getPos(sortedCols[sortedCols.length - 1]);
-
     // 最左和最右的列为窗口
     const windowCols = [sortedCols[0], sortedCols[sortedCols.length - 1]].filter(
       (c, i, a) => a.indexOf(c) === i
@@ -271,31 +280,44 @@ function parseSeatmapHtml(html: string, planeId: string, aircraftName: string): 
     ),
   ].sort((a, b) => a - b);
 
-  // 组装紧凑 Seat 列表
-  const cabinColMaps: Record<string, { windowCols: string[]; aisleCols: string[] }> = {};
-  for (const c of cabins) cabinColMaps[c.code] = { windowCols: c.windowCols, aisleCols: c.aisleCols };
-
-  const seats: Seat[] = rawSeats.map((s) => {
-    // 将 features 数组编码为 bitmask
+  // 编码每个座位的 feature bitmask
+  const allSeats = rawSeats.map((s) => {
     let f = 0;
     for (const feat of s.features) {
       const bit = F[feat.name as keyof typeof F];
       if (bit) f |= bit;
     }
-    const isWindow = cabinColMaps[s.cls]?.windowCols.includes(s.col) ?? false;
-    const isAisle  = cabinColMaps[s.cls]?.aisleCols.includes(s.col) ?? false;
-    return { n: s.number, cl: s.cls, f, w: isWindow ? 1 : 0, a: isAisle ? 1 : 0 } as Seat;
+    return { n: s.number, f };
   });
+
+  // 找出出现次数最多的 feature 值作为默认值
+  const featureCounts: Record<number, number> = {};
+  for (const s of allSeats) featureCounts[s.f] = (featureCounts[s.f] ?? 0) + 1;
+  const defaultFeature = parseInt(
+    Object.entries(featureCounts).sort((a, b) => b[1] - a[1])[0][0]
+  );
+
+  // 只输出非默认的座位，按 feature 值分组
+  const seatExceptions: SeatExceptions = {};
+  for (const s of allSeats) {
+    if (s.f !== defaultFeature) {
+      const key = String(s.f);
+      (seatExceptions[key] ??= []).push(s.n);
+    }
+  }
 
   // 舱等按排号排序
   cabins.sort((a, b) => a.rowStart - b.rowStart);
 
-  return { planeId, aircraftName, classFeatures, cabins, seats, wingRows, F };
+  return { planeId, aircraftName, classFeatures, cabins, defaultFeature, seatExceptions, wingRows, F };
 }
 
 async function fetchSeatmapHtml(planeId: string): Promise<string> {
   const url = `https://seatmaps.com/seatmaps/${planeId}.html?seatbar=hide&tooltip_on_hover=true&lang=zh-CN`;
   const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) {
+    throw new Error(`获取座位图失败: HTTP ${res.status} (planeId=${planeId})`);
+  }
   return res.text();
 }
 

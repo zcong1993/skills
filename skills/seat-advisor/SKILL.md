@@ -1,14 +1,15 @@
 ---
 name: seat-advisor
-description: "航班座位分析与推荐助手。当用户想选座、查座位图、问哪个位置好、或提供出发地/目的地/日期询问座位建议时触发。例如：'帮我看看 HKG 到 SYD 的座位'、'选座位推荐'、'A380 座位图'、'商务舱哪排最好'、'两个人坐哪里'、'靠窗好还是走道好'。会自动查询飞机型号、解析座位布局，给出专业且实用的建议。"
+description: "航班座位分析与推荐助手。查询航班座位图，分析机型布局，给出专业选座建议。"
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # seat-advisor：航班座位分析与推荐
 
 ## 前提
 
-脚本已内置 cookie，无需额外配置，直接运行即可。
+脚本已内置 cookie，可直接运行。cookie 有效期约数天，过期后脚本会报 401 错误，届时需更新 `scripts/fetch_seatmap.ts` 中的 `COOKIE` 常量。
 
 ## 输入收集
 
@@ -36,23 +37,43 @@ bun <skill_dir>/scripts/fetch_seatmap.ts flights <FROM> <TO> <DATE> [AIRLINE]
 
 返回 JSON 数组，每个元素含：`flightNo`、`airlineName`、`departureTime`、`arrivalTime`、`travelTime`、`aircraftName`、`planeId`
 
-**若只有一个航班**，直接进入 Step 2。
+根据返回的 `airlineCode` 和 `airlineName`，结合自身知识判断航司档次并标注。档次分三级：
+
+| 档次 | 标签 | 典型特征 | 示例 |
+|------|------|---------|------|
+| 全服务 | ✈ 全服务 | 含托运行李、餐食、选座通常免费 | 国泰 CX、新航 SQ、全日空 NH、澳航 QF、国航 CA |
+| 中端/混合 | ✈ 中端 | 基础票可能不含行李或餐食，但服务水平介于全服务和廉航之间 | 香港航空 HX、酷航长途 TR、越捷 VJ |
+| 廉航 | ⚡ 廉航 | 票价仅含座位，行李/餐食/选座均需另购 | 春秋 9C、乐桃 MM、亚航 AK/D7、捷星 3K/JQ、宿务太平洋 5J、瑞安 FR、易捷 U2 |
+
+上表仅供参考，实际判断以你对该航司的了解为准。如果遇到不确定的航司，标注为"中端"并注明"具体政策请查航司官网"。
+
+**若只有一个航班**，直接展示航司档次信息后进入 Step 2。
 
 **若有多个航班**，先列出让用户选择，格式：
 
 ```
 找到以下航班，请选择：
 
-1. QF128 澳洲航空  19:30 → 07:45 (9h 15m) | A330-300
-2. HX17  香港航空  22:05 → 10:35 (9h 30m) | A330-300
-3. CX181 国泰航空  00:45 → 12:45 (9h 0m)  | 777-300ER
+1. QF128 澳洲航空 ✈全服务  19:30 → 07:45 (9h 15m) | A330-300
+2. HX17  香港航空 ✈中端    22:05 → 10:35 (9h 30m) | A330-300
+3. CX181 国泰航空 ✈全服务  00:45 → 12:45 (9h 0m)  | 777-300ER
 
 请问你要看哪个航班的座位？
 ```
 
-用户选择后，再执行 Step 2。
+**廉航专属提醒**：若航班属于廉航，在航班列表后追加醒目提示：
 
-### Step 2：获取座位图
+```
+⚡ 提醒：[航司名] 为廉航，请注意：
+  · 选座通常需额外付费（靠窗/前排/腿部空间座更贵）
+  · 托运行李需另购，仅含随身小包
+  · 机上餐食和饮料需付费
+  · 座距通常比全服务航司更紧凑（28-29" vs 31-32"）
+```
+
+用户选择后，再执行 Step 2。记住用户选择的航司档次，后续推荐座位时会用到。
+
+### Step 2：获取座位图并展示
 
 ```bash
 bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
@@ -62,11 +83,18 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 - `aircraftName`：机型名称
 - `classFeatures`：各舱等参数（间距、宽度、充电、WiFi）
 - `cabins`：各舱等布局（排号范围、座位数、layout 如 "3-4-3"、windowCols、aisleCols）
-- `seats`：所有座位列表，紧凑格式 `{n: 座位号, cl: 舱等, f: feature bitmask, w: 是否靠窗, a: 是否靠走道}`；`w===0 && a===0` 即为中间座
-- `F`：feature bitmask 解码表，例如 `f & F.standardSeat` 非零表示标准座，`f & F.nearGalley` 非零表示靠近厨房
+- `defaultFeature`：大多数座位的 feature bitmask 值（通常是 `1024` 即 standardSeat），未出现在 seatExceptions 中的座位均为此值
+- `seatExceptions`：非默认 feature 的座位，按 feature 值分组，格式为 `{ "32": ["13A","13K",...], "3": ["22B",...] }`
+- `F`：feature bitmask 解码表，用按位与解码，例如 `f & F.standardSeat` 非零表示标准座，`f & F.nearGalley` 非零表示靠近厨房
 - `wingRows`：机翼遮挡窗口的排号列表
 
-### Step 2：展示机型信息
+**推导规则**（不在 JSON 中输出，从 cabins 推导）：
+- **舱等**：座位排号在某个 cabin 的 `rowStart`~`rowEnd` 范围内，即属于该舱等
+- **靠窗**：座位列字母在该舱等的 `windowCols` 中
+- **靠走道**：座位列字母在该舱等的 `aisleCols` 中
+- **中间座**：既不在 windowCols 也不在 aisleCols 中
+
+#### 展示机型信息
 
 **格式要求：专业、有料、不啰嗦。**
 
@@ -117,7 +145,7 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 
 > ⚠ 机翼遮挡：豪华经济舱 31-35 排、经济舱 40-46 排的窗口座（A/K 列）视野会被机翼部分遮挡，靠窗党需注意。
 
-### Step 2.5：沿途景观提示
+### Step 3：沿途景观提示
 
 根据出发地、目的地的地理位置、航班起飞时间和月份季节，判断靠窗能看到什么。
 
@@ -144,22 +172,28 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 
 若夜航或云层遮挡概率高，如实说明，不过度渲染。若景观两侧相当，说明"两侧无明显差异"。
 
-### Step 3：座位推荐
+### Step 4：座位推荐
 
 #### 默认推荐逻辑（1 人，未指定偏好）
 
+默认座位偏好取决于航司档次：
+- **全服务/中端航司** → 默认推荐**靠窗**（`isWindow: true`），因为座距舒适，靠窗可看风景且不被打扰
+- **廉航** → 默认推荐**靠走道**（`isAisle: true`），原因：廉航座距紧凑（通常 28-29"），走道座进出方便、不用翻越邻座，体感空间也更大；此外廉航靠窗/前排座通常要额外付费，走道座更可能是免费可选的
+
+用户明确说了偏好则优先遵循用户意愿，以上仅为默认策略。
+
 **目标座位特征：**
 - `features` 中有 `standardSeat:+`（免费标准座）
-- `isWindow: true`（靠窗）
+- 靠窗或靠走道（按上述默认策略）
 - 不在 `wingRows` 中（避开机翼遮挡）
 - 不含坏 feature（`nearGalley:-`、`nearLavatory:-`、`limitedRecline:-`、`noFloorStorage:-`、`getColdByExit:-`）
 
 **筛选步骤：**
 1. 过滤出符合上述条件的座位
-2. 优先选**靠前但不是最前两排**（过前容易噪音、离厕所近）的座位
+2. 优先选靠前但避开最前两排的位置（最前排靠近厨房/厕所，噪音和人流量大）
 3. 推荐 **2-3 个**备选，简述各自优缺点
 
-**推荐输出格式：**
+**推荐输出格式（全服务航司示例）：**
 
 ```
 💺 为你推荐（1人 · 经济舱 · 靠窗）
@@ -170,6 +204,21 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
   · 距厕所/厨房有足够距离
 
 备选：48A / 48K（更靠后，通常更安静）
+```
+
+**推荐输出格式（廉航示例）：**
+
+```
+💺 为你推荐（1人 · 经济舱 · 靠走道）
+
+首选：12C 或 12D
+  · 标准座，通常无需额外付费
+  · 靠走道，进出方便——廉航座距紧凑，走道座体感更宽敞
+  · 距厕所/厨房有足够距离
+
+备选：15C / 15D（更靠后，登机后上方行李架空间可能更充裕）
+
+💡 提示：廉航靠窗座和前排座通常需额外付费，如果不想加钱，走道座是性价比最高的选择。
 ```
 
 #### 2 人同行
@@ -200,6 +249,7 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 ## 注意事项
 
 - 座位可用性（已售/未售）脚本无法获取，说明此信息仅供参考，实际选座以航司 App 为准
-- cookie 有效期约数天，过期会报 401，提示用户更新脚本中的 `COOKIE` 常量
+- 若脚本报 401 错误，说明 cookie 已过期，提示用户更新 `scripts/fetch_seatmap.ts` 中的 `COOKIE` 常量
+- 若航班列表返回空数组，告知用户该航线/日期暂无数据，建议换日期或直接到航司官网查询
 - 若某排的 `features` 为空，说明该座无特殊标注，视为普通座位处理
 - 可通过 https://seatmaps.com/seatmaps/xxx.html （将 `xxx` 替换为 `planeId`）直接查看可视化座位图，作为补充参考
