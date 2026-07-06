@@ -27,9 +27,7 @@ disable-model-invocation: true
 
 ### Step 1：查询航班列表
 
-脚本位于 `scripts/fetch_seatmap.ts`（相对 SKILL.md 所在目录）。
-
-**第一步：拉取航班列表**（快，不含座位图）
+脚本位于 `scripts/fetch_seatmap.ts`（相对 SKILL.md 所在目录）。拉取航班列表（快，不含座位图）：
 
 ```bash
 bun <skill_dir>/scripts/fetch_seatmap.ts flights <FROM> <TO> <DATE> [AIRLINE]
@@ -71,7 +69,9 @@ bun <skill_dir>/scripts/fetch_seatmap.ts flights <FROM> <TO> <DATE> [AIRLINE]
   · 座距通常比全服务航司更紧凑（28-29" vs 31-32"）
 ```
 
-用户选择后，再执行 Step 2。记住用户选择的航司档次，后续推荐座位时会用到。
+用户选择后，再执行 Step 2。
+
+**完成判据：** 已确定唯一目标航班，拿到其 `planeId`、`aircraftName`，并记下**航司档次**（后续 Step 3/5 都要用）。
 
 ### Step 2：获取座位图并展示
 
@@ -100,7 +100,7 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 
 ```
 ✈ [航空公司] [航班号] · [出发]-[目的地] · [日期]
-航司档次：[✈全服务 / ✈中端 / ⚡廉航] — [一句话说明特点：含托运行李+餐食，选座通常免费 / 基础票可能不含行李或餐食，服务介于全服务和廉航之间 / 票价仅含座位，行李/餐食/选座均需另购]
+航司档次：[✈全服务 / ✈中端 / ⚡廉航] — [取 Step 1 档次表对应档次的"典型特征"一句]
 机型：[专业描述，见下方规则]
 
 舱等配置
@@ -221,22 +221,27 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 
 #### 默认推荐逻辑（1 人，未指定偏好）
 
-默认座位偏好取决于航司档次：
-- **全服务/中端航司** → 默认推荐**靠窗**（`isWindow: true`），因为座距舒适，靠窗可看风景且不被打扰
-- **廉航** → 默认推荐**靠走道**（`isAisle: true`），原因：廉航座距紧凑（通常 28-29"），走道座进出方便、不用翻越邻座，体感空间也更大；此外廉航靠窗/前排座通常要额外付费，走道座更可能是免费可选的
+默认座位偏好取决于**航司档次**（Step 1 记下的）：
+- **全服务/中端航司** → 默认**靠窗**（列字母 ∈ 该舱等 `windowCols`），座距舒适，可看风景且不被打扰
+- **廉航** → 默认**靠走道**（列字母 ∈ 该舱等 `aisleCols`）：廉航座距紧凑（约 28-29"），走道座进出方便、体感更宽敞；且廉航靠窗/前排常要加钱，走道座更可能免费可选
 
 用户明确说了偏好则优先遵循用户意愿，以上仅为默认策略。
 
-**目标座位特征：**
-- `features` 中有 `standardSeat:+`（免费标准座）
-- 靠窗或靠走道（按上述默认策略）
+**数据用法（见 Step 2）：** 未列入 `seatExceptions` 的座位其 feature 即 `defaultFeature`（含 `standardSeat`、无坏 bit），天然是免费标准座；`seatExceptions` 里的座位需按其 feature 值用 `F` 位判断好坏。
+
+**目标座位（全部需满足）：**
+- 属目标舱等（排号在 cabin 的 `rowStart`~`rowEnd` 内）
+- 靠窗 / 靠走道（按上述默认策略，用 `windowCols`/`aisleCols` 判断）
 - 不在 `wingRows` 中（避开机翼遮挡）
-- 不含坏 feature（`nearGalley:-`、`nearLavatory:-`、`limitedRecline:-`、`noFloorStorage:-`、`getColdByExit:-`）
+- 免费标准座且无坏 feature：**不出现在任何"坏 key"的 `seatExceptions` 列表里** —— 坏 key 指满足 `key & (F.nearGalley | F.nearLavatory | F.limitedRecline | F.noFloorStorage | F.getColdByExit | F.wingInWindow | F.misalignedWindow | F.trayTableInArmrest)` 非零的 feature 值
 
 **筛选步骤：**
-1. 过滤出符合上述条件的座位
-2. 优先选靠前但避开最前两排的位置（最前排靠近厨房/厕所，噪音和人流量大）
-3. 推荐 **2-3 个**备选，简述各自优缺点
+1. 先遍历 `seatExceptions` 全部 key，标出所有"坏 key"及其座位号，构成排除集
+2. 在目标舱等内，取靠窗/靠走道且不在 wingRows、不在排除集中的座位作为候选
+3. 候选中优先选**靠前但避开最前两排**（最前排靠近厨房/厕所，噪音和人流量大）
+4. 推荐 **2-3 个**备选，简述各自优缺点
+
+**完成判据：** `seatExceptions` 的坏 key 已全部扫过并排除，`wingRows` 已排除，最终 2-3 个备选都满足上面"目标座位"的全部条件。
 
 **推荐输出格式（全服务航司示例）：**
 
@@ -268,13 +273,11 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 
 #### 2 人同行
 
-从 `cabins` 读取该舱等的 `layout`，说明布局并推荐：
+2 人选座的核心判据只有一个：**邻座陌生人** —— 你们这一排组里除你们俩外还坐不坐外人。据此从 `cabins` 读 `layout` 推荐，每条都点明邻座陌生人情况：
 
-- **3-4-3 布局（经济舱）**：推荐 A+B（左窗口组）或 J+K（右窗口组）。A/K 靠窗，B/J 紧邻，两人相邻且都靠近窗口。中间组 4 座共享，两侧各有陌生人。
-- **2-4-2 布局（豪华经济）**：推荐 A+C 或 H+K，整组就你们两人，两侧无人打扰。
-- **1-2-1 布局（商务舱）**：每人独立，推荐相邻的 D+G（中间组，可搭话）或对侧的 A+K（各自靠窗）。
-
-输出要清楚说明"你们旁边还有没有陌生人"。
+- **3-4-3 布局（经济舱）**：推荐 A+B（左窗口组）或 J+K（右窗口组），两人相邻且靠窗；但该组第三座（C/H）是**邻座陌生人**。中间 4 座组两侧都有外人，不推荐。
+- **2-4-2 布局（豪华经济）**：推荐 A+C 或 H+K —— 整组就你们俩，**无邻座陌生人**。
+- **1-2-1 布局（商务舱）**：每人独立座，本就**无邻座陌生人**；推荐相邻的 D+G（中间组，可搭话）或对侧 A+K（各自靠窗）。
 
 **示例：**
 
@@ -283,18 +286,18 @@ bun <skill_dir>/scripts/fetch_seatmap.ts seatmap <PLANE_ID> "<AIRCRAFT_NAME>"
 
 推荐：42A + 42B（或 42J + 42K）
   · 布局：[A B C] [D E F G] [H J K]
-  · A/K 靠窗，B/J 紧邻——你们两人相邻，旁边 C/H 位置是陌生人
-  · 若想完全不被打扰，考虑豪华经济 2-4-2 舱（A+C 或 H+K，整组就你们两人）
+  · A/K 靠窗，B/J 紧邻——你们两人相邻，邻座陌生人在 C/H
+  · 若想完全无邻座陌生人，考虑豪华经济 2-4-2 舱（A+C 或 H+K，整组就你们俩）
 ```
 
 #### 用户明确愿意加钱
 
-推荐带 `extraLegroom:+`、`exitRow:+` 的座位，说明额外收费原因（出口排腿部空间大、紧急出口须配合乘务员）。带婴儿可推荐 `bassinet:+` 座位并说明位置特点。
+在 `seatExceptions` 里找 `key & F.extraLegroom` 或 `key & F.exitRow` 非零的座位，说明额外收费原因（出口排腿部空间大、紧急出口须配合乘务员）。带婴儿可找 `key & F.bassinet` 非零的座位并说明位置特点。
 
 ## 注意事项
 
 - 座位可用性（已售/未售）脚本无法获取，说明此信息仅供参考，实际选座以航司 App 为准
 - 若脚本报 401 错误，说明 cookie 已过期，提示用户更新 `scripts/fetch_seatmap.ts` 中的 `COOKIE` 常量
 - 若航班列表返回空数组，告知用户该航线/日期暂无数据，建议换日期或直接到航司官网查询
-- 若某排的 `features` 为空，说明该座无特殊标注，视为普通座位处理
+- 未列入 `seatExceptions` 的座位其 feature 即 `defaultFeature`，视为普通标准座处理
 - 可通过 https://seatmaps.com/seatmaps/xxx.html （将 `xxx` 替换为 `planeId`）直接查看可视化座位图，作为补充参考
